@@ -94,6 +94,7 @@ func adjust(m proto.Message, offset time.Duration) {
 func adjustGUID(m proto.Message, guid string) {
 
 	reflect.ValueOf(m).Elem().FieldByName("AgentGUID").Set(reflect.ValueOf(proto.String(guid)))
+	reflect.ValueOf(m).Elem().FieldByName("SiteId").Set(reflect.ValueOf(proto.String("")))
 }
 
 /*
@@ -130,7 +131,7 @@ func doPosts() {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	client := &http.Client{Transport: tr}
-	hostUrl := "https://10.0.60.30/api/datacollection/"
+	hostUrl := "https://ec2-54-161-226-123.compute-1.amazonaws.com/api/datacollection/"
 
 	for {
 
