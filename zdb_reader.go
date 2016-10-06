@@ -5,6 +5,7 @@ import (
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	"log"
+	"os"
 
 	"crypto/hmac"
 	"crypto/rand"
@@ -21,6 +22,8 @@ import (
 	"bytes"
 	"crypto/tls"
 	"io/ioutil"
+
+	"crypto/md5"
 	"net/http"
 	"sync"
 	"time"
@@ -91,10 +94,13 @@ func adjust(m proto.Message, offset time.Duration) {
 
 }
 
-func adjustGUID(m proto.Message, guid string) {
-
+func adjustGUID(msgTag string, m proto.Message, guid string) {
+	if msgTag == "SystemInventory" {
+		reflect.ValueOf(m).Elem().FieldByName("ComputerName").Set(reflect.ValueOf(proto.String(guid)))
+	}
 	reflect.ValueOf(m).Elem().FieldByName("AgentGUID").Set(reflect.ValueOf(proto.String(guid)))
-	reflect.ValueOf(m).Elem().FieldByName("SiteId").Set(reflect.ValueOf(proto.String("")))
+	siteid := fmt.Sprintf("%x", md5.Sum([]byte("a04.cloud.ziften.com")))
+	reflect.ValueOf(m).Elem().FieldByName("SiteId").Set(reflect.ValueOf(proto.String(siteid)))
 }
 
 /*
@@ -107,7 +113,7 @@ type AgentXMLMessage struct {
 }
 */
 var hmacSecretKey string = "UTv5N7OWd4wBRkrL4NbD"
-var httpParallelism int = 10
+var httpParallelism int = 100
 
 func calcHmac(secret string, message []byte) string {
 
@@ -125,42 +131,58 @@ func xmlTemplate(messageType string, hmac string, b64payload string) string {
 var httpChannel chan string = make(chan string, httpParallelism)
 var wg sync.WaitGroup
 
-func doPosts() {
+func doPosts(hostUrl string) {
 	sem := make(chan int, httpParallelism)
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	lru := tls.NewLRUClientSessionCache(1)
+
+	tlsConfig := &tls.Config{InsecureSkipVerify: true,
+		ClientSessionCache: lru,
 	}
+
+	tr := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
+	//t := &http.Client{Transport: tr}
 	client := &http.Client{Transport: tr}
-	hostUrl := "https://ec2-54-161-226-123.compute-1.amazonaws.com/api/datacollection/"
+	//hostUrl := "https://ec2-54-161-226-123.compute-1.amazonaws.com/api/datacollection/"
 
 	for {
-
 		sem <- 1
+		go func() {
 
-		payload := <-httpChannel
+			payload := <-httpChannel
 
-		req, _ := http.NewRequest("POST", hostUrl, bytes.NewBuffer([]byte(payload)))
-		req.Header.Add("Content-Type", "text/xml")
-		resp, err := client.Do(req)
+			req, _ := http.NewRequest("POST", hostUrl, bytes.NewBuffer([]byte(payload)))
+			req.Header.Add("Content-Type", "text/xml")
 
-		if err != nil {
-			fmt.Println(err)
-		} else {
-			_, _ = ioutil.ReadAll(resp.Body)
-			resp.Body.Close()
+			resp, err := client.Do(req)
 
-			fmt.Printf("%v,", resp.StatusCode)
-		}
+			//fmt.Printf("Did Resume: %v\n\n", resp.TLS.DidResume)
 
-		<-sem
-		wg.Done()
+			if err != nil {
+				fmt.Println(err)
+			} else {
+				_, _ = ioutil.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				fmt.Printf("%v,", resp.StatusCode)
+			}
+			<-sem
+			wg.Done()
+		}()
+
 	}
 
 }
 
+// args
+// hostUrl
 func main() {
 	//fmt.Println("Start")
-	go doPosts()
+	hostUrl := os.Args[1]
+
+	go doPosts(hostUrl + "/api/datacollection/")
 
 	database_file := "./zdbs/ziften_1_hour.zdb"
 	now := time.Now()
@@ -210,7 +232,7 @@ func main() {
 		}
 
 		adjust(si.(proto.Message), offset)
-		adjustGUID(si.(proto.Message), guid)
+		adjustGUID(msgTag, si.(proto.Message), guid)
 		msgBytes, _ := proto.Marshal(si.(proto.Message))
 		hmac := calcHmac(hmacSecretKey, msgBytes)
 		msgEncoded := base64.StdEncoding.EncodeToString(msgBytes)
