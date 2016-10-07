@@ -11,9 +11,9 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 
-	"encoding/base64"
+	//"encoding/base64"
 	proto "github.com/golang/protobuf/proto"
-	_ "github.com/michaelritsema/ziften-event-forwarder/msg"
+	msg "github.com/michaelritsema/ziften-event-forwarder/msg"
 	"io"
 
 	"reflect"
@@ -24,6 +24,7 @@ import (
 	"io/ioutil"
 
 	"crypto/md5"
+	"encoding/binary"
 	"net/http"
 	"sync"
 	"time"
@@ -99,7 +100,7 @@ func adjustGUID(msgTag string, m proto.Message, guid string) {
 		reflect.ValueOf(m).Elem().FieldByName("ComputerName").Set(reflect.ValueOf(proto.String(guid)))
 	}
 	reflect.ValueOf(m).Elem().FieldByName("AgentGUID").Set(reflect.ValueOf(proto.String(guid)))
-	siteid := fmt.Sprintf("%x", md5.Sum([]byte("a04.cloud.ziften.com")))
+	siteid := fmt.Sprintf("%x", md5.Sum([]byte("a01.cloud.ziften.com")))
 	reflect.ValueOf(m).Elem().FieldByName("SiteId").Set(reflect.ValueOf(proto.String(siteid)))
 }
 
@@ -113,22 +114,31 @@ type AgentXMLMessage struct {
 }
 */
 var hmacSecretKey string = "UTv5N7OWd4wBRkrL4NbD"
-var httpParallelism int = 100
+var httpParallelism int = 10
 
-func calcHmac(secret string, message []byte) string {
+func calcHmac(secret string, message []byte) []byte {
 
 	key := []byte(secret)
 	h := hmac.New(sha1.New, key)
 
 	h.Write(message)
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	return h.Sum(nil)
 }
-func xmlTemplate(messageType string, hmac string, b64payload string) string {
-	xml := "<pb type=\"%s\" HMAC=\"%s\">%s</pb>"
-	return fmt.Sprintf(xml, messageType, hmac, b64payload)
+func xmlTemplate(messageType string, hmac []byte, msgBytes []byte) *msg.FrameHeader {
+
+	frameHeader := &msg.FrameHeader{
+		Length:    proto.Int(len(msgBytes)),
+		Version:   proto.Int(5),
+		Type:      proto.String(messageType),
+		Hmac:      hmac,
+		TimeStamp: proto.Int64(0),
+	}
+
+	return frameHeader
+
 }
 
-var httpChannel chan string = make(chan string, httpParallelism)
+var httpChannel chan []byte = make(chan []byte, httpParallelism)
 var wg sync.WaitGroup
 
 func doPosts(hostUrl string) {
@@ -150,14 +160,28 @@ func doPosts(hostUrl string) {
 	for {
 		sem <- 1
 		go func() {
+			payloadCount := 0
+			totalPayload := []byte{}
+			i := 0
+		L:
+			for ; i < 500; i++ {
+				select {
 
-			payload := <-httpChannel
+				case payload := <-httpChannel:
+					totalPayload = append(totalPayload, payload...)
+					payloadCount++
+				default:
+					break L
 
-			req, _ := http.NewRequest("POST", hostUrl, bytes.NewBuffer([]byte(payload)))
-			req.Header.Add("Content-Type", "text/xml")
+				}
+			}
+
+			//fmt.Println("====")
+			req, _ := http.NewRequest("POST", hostUrl, bytes.NewBuffer([]byte(totalPayload)))
+			req.Header.Add("Content-Type", "application/octet-stream")
 
 			resp, err := client.Do(req)
-
+			fmt.Printf("Send batch of %d\n", i)
 			//fmt.Printf("Did Resume: %v\n\n", resp.TLS.DidResume)
 
 			if err != nil {
@@ -169,9 +193,8 @@ func doPosts(hostUrl string) {
 				fmt.Printf("%v,", resp.StatusCode)
 			}
 			<-sem
-			wg.Done()
+			wg.Add(-1 * payloadCount)
 		}()
-
 	}
 
 }
@@ -235,14 +258,24 @@ func main() {
 		adjustGUID(msgTag, si.(proto.Message), guid)
 		msgBytes, _ := proto.Marshal(si.(proto.Message))
 		hmac := calcHmac(hmacSecretKey, msgBytes)
-		msgEncoded := base64.StdEncoding.EncodeToString(msgBytes)
+		//msgEncoded := base64.StdEncoding.EncodeToString(msgBytes)
 		//fmt.Printf("%s\n", xmlTemplate(msgTag, hmac, msgEncoded))
 
-		payload := xmlTemplate(msgTag, hmac, msgEncoded)
+		payload := xmlTemplate(msgTag, hmac, msgBytes)
 
-		fmt.Printf("Sending %s\n", msgTag)
+		//fmt.Printf("Sending %s\n", msgTag)
 		wg.Add(1)
-		httpChannel <- payload
+		frameHeaderBytes, _ := proto.Marshal(payload)
+
+		buf := bytes.NewBuffer([]byte{})
+		var s int32 = int32(len(frameHeaderBytes))
+		binary.Write(buf, binary.BigEndian, s)
+		//fmt.Printf("%x\n\n", buf)
+		finalMessage := []byte{}
+
+		finalMessage = append(buf.Bytes(), frameHeaderBytes...)
+		finalMessage = append(finalMessage, msgBytes...)
+		httpChannel <- finalMessage
 
 	}
 
